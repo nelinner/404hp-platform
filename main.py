@@ -1030,6 +1030,15 @@ async def cmd_next(m: Message):
             return
     await m.answer("Этот чат не является лобби-группой.")
 
+@router.message(Command("chatid"))
+async def cmd_chatid(m: Message):
+    """Показывает реальный chat_id текущего чата."""
+    await m.answer(
+        f"🆔 <b>Chat ID:</b> <code>{m.chat.id}</code>\n"
+        f"📛 <b>Title:</b> {m.chat.title or '—'}\n"
+        f"📁 <b>Type:</b> {m.chat.type}"
+    )
+
 
 # ============================================================
 #                            MAIN
