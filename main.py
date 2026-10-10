@@ -19,6 +19,20 @@ REFRESH_INTERVAL = 15 * 60  # 15 минут
 
 
 # ============================================================
+#                  HELPER: SEND TO (chat, thread)
+# ============================================================
+async def tg_send(target, text, **kwargs):
+    """target = (chat_id, thread_id) или просто chat_id."""
+    if isinstance(target, tuple):
+        chat_id, thread_id = target
+    else:
+        chat_id, thread_id = target, None
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+    return await bot.send_message(chat_id, text, **kwargs)
+
+
+# ============================================================
 #                       KEYBOARDS
 # ============================================================
 def main_menu(is_admin_flag=False):
@@ -161,10 +175,11 @@ async def reg_gid(m: Message, state: FSMContext):
 async def reg_nick(m: Message, state: FSMContext):
     if not m.text or len(m.text) > 32:
         return await m.answer("⚠️ Ник должен быть от 1 до 32 символов.")
-    # проверка уникальности ника
+
     existing = await db.find_user_by_login(m.text)
     if existing and existing["user_id"] != m.from_user.id:
         return await m.answer("⚠️ Этот ник уже занят. Введи другой.")
+
     await state.update_data(nickname=m.text)
     d = await state.get_data()
     await state.set_state(Reg.confirm)
@@ -221,7 +236,8 @@ async def profile(c: CallbackQuery):
     if u["calibrated"]:
         lvl, name = get_level(u["mmr"])
         lvl_txt = f"<b>{lvl}</b> — {name} ({u['mmr']} MMR)"
-    league_txt = "💎 <b>Pro league</b>" if (u.get("league") or "default") == "pro" else "🟦 <b>Default league</b>"
+    league_txt = ("💎 <b>Pro league</b>" if (u.get("league") or "default") == "pro"
+                  else "🟦 <b>Default league</b>")
     txt = (
         f"[👤] <b>{u['nickname']}</b>\n"
         f"@{u['username'] or '—'}\n"
@@ -318,11 +334,9 @@ async def party_invite_do(m: Message, state: FSMContext):
     if len(members) >= 3:
         await state.clear()
         return await m.answer("Пати уже заполнено.", reply_markup=back_menu())
-
     if target["user_id"] in members:
         await state.clear()
         return await m.answer("Игрок уже в пати.", reply_markup=back_menu())
-
     if await db.get_party_by_member(target["user_id"]):
         await state.clear()
         return await m.answer("Этот игрок уже в другой пати.", reply_markup=back_menu())
@@ -419,7 +433,8 @@ async def search_league(c: CallbackQuery):
         return await c.answer("🚫 Тебе недоступна Pro league.", show_alert=True)
     lobby = await db.get_open_lobby(mode, league)
     if not lobby:
-        return await c.answer("❌ Открытых лобби нет. Подожди обновления.", show_alert=True)
+        return await c.answer("❌ Открытых лобби нет. Подожди обновления.",
+                              show_alert=True)
     await c.message.edit_text(
         f"✅ Игра найдена!\n\n"
         f"Режим: <b>{mode}</b>\nЛига: <b>{LEAGUES[league]}</b>\n"
@@ -562,7 +577,7 @@ async def finalize_lobby(lid):
         "с хостом или с созданием лобби, то обратитесь в тех поддержку канала"
     ]
     try:
-        await bot.send_message(CHANNEL_DRAW, "\n".join(lines))
+        await tg_send(CHANNEL_DRAW, "\n".join(lines))
     except Exception as e:
         print("draw send err:", e)
 
@@ -575,49 +590,58 @@ async def finalize_lobby(lid):
     except Exception:
         pass
 
-    await spawn_lobby(l["mode"], l["league"], l["chat_id"])
+    await spawn_lobby(l["mode"], l["league"],
+                      (l["chat_id"], l.get("thread_id")))
 
 
-async def spawn_lobby(mode, league, chat_id):
+async def spawn_lobby(mode, league, chat_target):
+    chat_id, thread_id = (chat_target if isinstance(chat_target, tuple)
+                          else (chat_target, None))
     map_name = random.choice(MAPS)
     num = await db.next_match_number()
-    lid = await db.create_lobby(mode, league, map_name, num, chat_id)
+    lid = await db.create_lobby(mode, league, map_name, num, chat_id, thread_id)
     l = await db.get_lobby(lid)
+
+    kwargs = {}
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
     msg = await bot.send_message(
-        chat_id, render_lobby(l, []), reply_markup=lobby_kb(lid))
+        chat_id, render_lobby(l, []), reply_markup=lobby_kb(lid), **kwargs)
     await db.update_lobby(lid, message_id=msg.message_id)
 
 
-async def close_and_respawn(mode, league, chat_id):
-    """Удаляет открытые лобби в чате и создаёт новое."""
+async def close_and_respawn(mode, league, chat_target):
+    chat_id, thread_id = (chat_target if isinstance(chat_target, tuple)
+                          else (chat_target, None))
     async with aiosqlite.connect(db.DB) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
-            "SELECT * FROM lobbies WHERE chat_id=? AND status='open'",
-            (chat_id,))
+            "SELECT * FROM lobbies WHERE chat_id=? AND "
+            "COALESCE(thread_id,0)=COALESCE(?,0) AND status='open'",
+            (chat_id, thread_id))
         old = [dict(r) for r in await cur.fetchall()]
+
     for l in old:
         try:
             await bot.delete_message(l["chat_id"], l["message_id"])
         except Exception:
             pass
         await db.update_lobby(l["id"], status="closed")
-    await spawn_lobby(mode, league, chat_id)
+
+    await spawn_lobby(mode, league, chat_target)
 
 
 async def refresh_all_lobbies():
-    """Ручное обновление всех лобби (кнопка в админке)."""
-    for (mode, league), chat_id in GROUPS.items():
+    for (mode, league), target in GROUPS.items():
         try:
-            await close_and_respawn(mode, league, chat_id)
+            await close_and_respawn(mode, league, target)
         except Exception as e:
             print(f"refresh {mode}/{league} err:", e)
 
 
 async def auto_refresh_loop():
-    """Фоновая задача: обновляет все лобби каждые 15 минут."""
-    # Первая публикация сразу при старте
-    await asyncio.sleep(3)  # небольшая задержка, чтобы бот успел подняться
+    # Первая публикация сразу после старта
+    await asyncio.sleep(3)
     try:
         await refresh_all_lobbies()
         print("✅ Первичная публикация лобби выполнена")
@@ -720,7 +744,7 @@ async def publish_results(mid):
         lines.append(f"[👤] {p['nickname']} | {p['game_id']} | LV {p['lvl']}")
     lines.append("━━━━━━━━━━━━━━━━━━━")
     try:
-        await bot.send_message(CHANNEL_RESULTS, "\n".join(lines))
+        await tg_send(CHANNEL_RESULTS, "\n".join(lines))
     except Exception as e:
         print("results err:", e)
     for uid in ct:
@@ -752,8 +776,7 @@ async def admin_list(c: CallbackQuery):
         lg = "💎" if (x.get("league") or "default") == "pro" else "🟦"
         lines.append(
             f"<b>{x['nickname']}</b> | @{x['username'] or '—'} | {x['game_id']} | "
-            f"{lg} | {'💠' if x['calibrated'] else '🔒'} {x['mmr']} MMR"
-        )
+            f"{lg} | {'💠' if x['calibrated'] else '🔒'} {x['mmr']} MMR")
     await c.message.edit_text("\n".join(lines), reply_markup=back_menu())
 
 
@@ -809,12 +832,16 @@ async def admin_do(c: CallbackQuery, state: FSMContext):
 
     if act == "league_default":
         await db.update_user(uid, league="default")
-        await c.message.edit_text("✅ Выдана <b>Default league</b>.", reply_markup=back_menu())
-        await state.clear(); return
+        await c.message.edit_text("✅ Выдана <b>Default league</b>.",
+                                  reply_markup=back_menu())
+        await state.clear()
+        return
     if act == "league_pro":
         await db.update_user(uid, league="pro")
-        await c.message.edit_text("✅ Выдана <b>Pro league</b>.", reply_markup=back_menu())
-        await state.clear(); return
+        await c.message.edit_text("✅ Выдана <b>Pro league</b>.",
+                                  reply_markup=back_menu())
+        await state.clear()
+        return
 
     field = {"ban": ("is_banned", 1), "unban": ("is_banned", 0),
              "mute": ("is_muted", 1), "unmute": ("is_muted", 0),
@@ -976,12 +1003,14 @@ async def admin_tickets(c: CallbackQuery):
         return await c.answer("Нет доступа.", show_alert=True)
     ts = await db.open_tickets()
     if not ts:
-        return await c.message.edit_text("Нет открытых тикетов.", reply_markup=back_menu())
+        return await c.message.edit_text("Нет открытых тикетов.",
+                                         reply_markup=back_menu())
     lines = ["🎫 <b>Открытые тикеты:</b>", ""]
     btns = []
     for t in ts:
         author = await db.get_user(t["user_id"])
-        who = f"{author['nickname']} (@{author['username'] or '—'})" if author else t["user_id"]
+        who = (f"{author['nickname']} (@{author['username'] or '—'})"
+               if author else str(t["user_id"]))
         lines.append(f"#{t['id']} | {t['type']} | {who}\n<i>{t['description'][:80]}</i>")
         btns.append([B(text=f"Закрыть #{t['id']}", callback_data=f"tclose:{t['id']}")])
     btns.append([B(text="⬅️ Назад", callback_data="admin_panel")])
@@ -1016,18 +1045,31 @@ async def cmd_start_lobbies(m: Message):
     if not is_admin(u):
         return
     await refresh_all_lobbies()
-    await m.answer("✅ Лобби инициализированы во всех группах.")
+    await m.answer("✅ Лобби инициализированы во всех топиках.")
+
+
+@router.message(Command("next"))
+async def cmd_next(m: Message):
+    u = await db.get_user(m.from_user.id)
+    if not is_admin(u):
+        return
+    tid = getattr(m, "message_thread_id", None)
+    for (mode, league), target in GROUPS.items():
+        chat_id, thread_id = target
+        if chat_id == m.chat.id and thread_id == tid:
+            await close_and_respawn(mode, league, target)
+            return
+    await m.answer("Этот топик не настроен как лобби.")
 
 
 @router.message(Command("chatid"))
 async def cmd_chatid(m: Message):
-    thread_id = getattr(m, "message_thread_id", None)
+    tid = getattr(m, "message_thread_id", None)
     await m.answer(
         f"🆔 <b>Chat ID:</b> <code>{m.chat.id}</code>\n"
-        f"🧵 <b>Thread ID:</b> <code>{thread_id or '— (это General)'}</code>\n"
+        f"🧵 <b>Thread ID:</b> <code>{tid or '— (General)'}</code>\n"
         f"📛 <b>Title:</b> {m.chat.title or '—'}\n"
-        f"📁 <b>Type:</b> {m.chat.type}"
-    )
+        f"📁 <b>Type:</b> {m.chat.type}")
 
 
 # ============================================================
@@ -1040,7 +1082,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Запускаем фоновую задачу авто-обновления лобби
+    # Фоновая задача авто-обновления лобби каждые 15 минут
     asyncio.create_task(auto_refresh_loop())
 
     print("🤖 404hp faceit bot started")
