@@ -1019,22 +1019,12 @@ async def cmd_start_lobbies(m: Message):
     await m.answer("✅ Лобби инициализированы во всех группах.")
 
 
-@router.message(Command("next"))
-async def cmd_next(m: Message):
-    u = await db.get_user(m.from_user.id)
-    if not is_admin(u):
-        return
-    for (mode, league), chat_id in GROUPS.items():
-        if chat_id == m.chat.id:
-            await close_and_respawn(mode, league, chat_id)
-            return
-    await m.answer("Этот чат не является лобби-группой.")
-
 @router.message(Command("chatid"))
 async def cmd_chatid(m: Message):
-    """Показывает реальный chat_id текущего чата."""
+    thread_id = getattr(m, "message_thread_id", None)
     await m.answer(
         f"🆔 <b>Chat ID:</b> <code>{m.chat.id}</code>\n"
+        f"🧵 <b>Thread ID:</b> <code>{thread_id or '— (это General)'}</code>\n"
         f"📛 <b>Title:</b> {m.chat.title or '—'}\n"
         f"📁 <b>Type:</b> {m.chat.type}"
     )
