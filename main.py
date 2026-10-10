@@ -1,4 +1,5 @@
 import asyncio, random, json, time
+import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
                            InlineKeyboardButton as B)
@@ -14,10 +15,11 @@ import database as db
 
 router = Router()
 bot: Bot = None
+REFRESH_INTERVAL = 15 * 60  # 15 минут
 
 
 # ============================================================
-#                       KEYBOARDS (inline)
+#                       KEYBOARDS
 # ============================================================
 def main_menu(is_admin_flag=False):
     rows = [
@@ -41,8 +43,7 @@ def confirm_registration():
 
 def back_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [B(text="⬅️ Назад", callback_data="main_menu")]
-    ])
+        [B(text="⬅️ Назад", callback_data="main_menu")]])
 
 
 def party_kb(has_party=False):
@@ -62,31 +63,27 @@ def ticket_kb():
         [B(text="🚫 Жалоба на игрока", callback_data="ticket:player")],
         [B(text="🛡 Жалоба на админа", callback_data="ticket:admin")],
         [B(text="✍️ Описать проблему", callback_data="ticket:custom")],
-        [B(text="⬅️ Назад", callback_data="main_menu")],
-    ])
+        [B(text="⬅️ Назад", callback_data="main_menu")]])
 
 
 def search_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [B(text="5x5", callback_data="search:5x5"),
          B(text="2x2", callback_data="search:2x2")],
-        [B(text="⬅️ Назад", callback_data="main_menu")],
-    ])
+        [B(text="⬅️ Назад", callback_data="main_menu")]])
 
 
 def league_kb(mode):
     return InlineKeyboardMarkup(inline_keyboard=[
         [B(text="Default league", callback_data=f"league:{mode}:default")],
         [B(text="Pro league",     callback_data=f"league:{mode}:pro")],
-        [B(text="⬅️ Назад", callback_data="menu_search")],
-    ])
+        [B(text="⬅️ Назад", callback_data="menu_search")]])
 
 
 def lobby_kb(lobby_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [B(text="🚪 Присоединиться", callback_data=f"lobby_join:{lobby_id}")],
-        [B(text="⬅️ Выйти",         callback_data=f"lobby_leave:{lobby_id}")],
-    ])
+        [B(text="⬅️ Выйти",         callback_data=f"lobby_leave:{lobby_id}")]])
 
 
 def host_kb():
@@ -94,8 +91,7 @@ def host_kb():
         [B(text="📋 Мои матчи",         callback_data="host_list")],
         [B(text="✅ Зарегистрировать",  callback_data="host_register")],
         [B(text="🚫 Отменить матч",     callback_data="host_cancel")],
-        [B(text="⬅️ Назад",             callback_data="main_menu")],
-    ])
+        [B(text="⬅️ Назад",             callback_data="main_menu")]])
 
 
 def admin_kb():
@@ -109,21 +105,25 @@ def admin_kb():
         [B(text="🛡 Выдать админку",       callback_data="admin_grant")],
         [B(text="🚫 Забрать админку",      callback_data="admin_revoke")],
         [B(text="🎫 Тикеты",               callback_data="admin_tickets")],
-        [B(text="⬅️ Назад",               callback_data="main_menu")],
-    ])
+        [B(text="⬅️ Назад",               callback_data="main_menu")]])
 
 
 # ============================================================
-#                       ADMIN CHECK
+#                       HELPERS
 # ============================================================
 def is_admin(u):
-    """Единая проверка админа. Используется ВЕЗДЕ, чтобы кнопка не пропадала."""
     if not u:
         return False
     if u.get("is_admin"):
         return True
-    username = (u.get("username") or "").lstrip("@")
-    return username == OWNER_USERNAME
+    return (u.get("username") or "").lstrip("@").lower() == OWNER_USERNAME.lower()
+
+
+async def edit_or_send(c: CallbackQuery, text: str, kb=None):
+    try:
+        await c.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await c.message.answer(text, reply_markup=kb)
 
 
 # ============================================================
@@ -141,10 +141,8 @@ async def cmd_start(m: Message, state: FSMContext):
         return
     u = await db.get_user(m.from_user.id)
     if u and u["registered"]:
-        return await m.answer(
-            "🏠 <b>404hp faceit</b>\nГлавное меню:",
-            reply_markup=main_menu(is_admin(u))
-        )
+        return await m.answer("🏠 <b>404hp faceit</b>\nГлавное меню:",
+                              reply_markup=main_menu(is_admin(u)))
     await state.set_state(Reg.game_id)
     await m.answer("🎮 Добро пожаловать в <b>404hp faceit</b>!\n\n"
                    "Шаг 1/3 — отправь свой <b>игровой ID</b> (Standoff 2):")
@@ -163,12 +161,17 @@ async def reg_gid(m: Message, state: FSMContext):
 async def reg_nick(m: Message, state: FSMContext):
     if not m.text or len(m.text) > 32:
         return await m.answer("⚠️ Ник должен быть от 1 до 32 символов.")
+    # проверка уникальности ника
+    existing = await db.find_user_by_login(m.text)
+    if existing and existing["user_id"] != m.from_user.id:
+        return await m.answer("⚠️ Этот ник уже занят. Введи другой.")
     await state.update_data(nickname=m.text)
     d = await state.get_data()
     await state.set_state(Reg.confirm)
     txt = (f"Шаг 3/3 — подтверди свои данные:\n\n"
            f"🆔 ID: <code>{d['game_id']}</code>\n"
-           f"👤 Ник: <b>{d['nickname']}</b>")
+           f"👤 Ник: <b>{d['nickname']}</b>\n"
+           f"📛 Telegram: @{m.from_user.username or '—'}")
     await m.answer(txt, reply_markup=confirm_registration())
 
 
@@ -177,8 +180,7 @@ async def reg_done(c: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     await db.create_user(c.from_user.id, c.from_user.username or "",
                          d["game_id"], d["nickname"])
-    # Автовыдача админки владельцу
-    if (c.from_user.username or "").lstrip("@") == OWNER_USERNAME:
+    if (c.from_user.username or "").lstrip("@").lower() == OWNER_USERNAME.lower():
         await db.update_user(c.from_user.id, is_admin=1)
     await state.clear()
     u = await db.get_user(c.from_user.id)
@@ -186,9 +188,8 @@ async def reg_done(c: CallbackQuery, state: FSMContext):
         "✅ Регистрация успешно завершена!\n\n"
         "ℹ️ Твой LVL скрыт до <b>10 калибровочных игр</b>.\n"
         "Стартовый MMR: <b>300</b> (скрыт).\n"
-        "Твоя лига по умолчанию: <b>🟦 Default league</b>.",
-        reply_markup=main_menu(is_admin(u))
-    )
+        "Лига: <b>🟦 Default league</b>.",
+        reply_markup=main_menu(is_admin(u)))
 
 
 @router.callback_query(F.data == "reg_cancel", Reg.confirm)
@@ -203,17 +204,8 @@ async def reg_cancel(c: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "main_menu")
 async def goto_main(c: CallbackQuery):
     u = await db.get_user(c.from_user.id)
-    try:
-        await c.message.edit_text(
-            "🏠 <b>404hp faceit</b>\nГлавное меню:",
-            reply_markup=main_menu(is_admin(u))
-        )
-    except Exception:
-        # Если сообщение нельзя отредактировать — отправляем новое
-        await c.message.answer(
-            "🏠 <b>404hp faceit</b>\nГлавное меню:",
-            reply_markup=main_menu(is_admin(u))
-        )
+    await edit_or_send(c, "🏠 <b>404hp faceit</b>\nГлавное меню:",
+                       main_menu(is_admin(u)))
 
 
 # ============================================================
@@ -224,19 +216,15 @@ async def profile(c: CallbackQuery):
     u = await db.get_user(c.from_user.id)
     if not u:
         return await c.answer("Сначала зарегистрируйся: /start", show_alert=True)
-
     kd = round(u["kills"] / u["deaths"], 2) if u["deaths"] else u["kills"]
-
     lvl_txt = "🔒 Скрыт (калибровка)"
     if u["calibrated"]:
         lvl, name = get_level(u["mmr"])
         lvl_txt = f"<b>{lvl}</b> — {name} ({u['mmr']} MMR)"
-
-    league = u.get("league") or "default"
-    league_txt = "💎 <b>Pro league</b>" if league == "pro" else "🟦 <b>Default league</b>"
-
+    league_txt = "💎 <b>Pro league</b>" if (u.get("league") or "default") == "pro" else "🟦 <b>Default league</b>"
     txt = (
         f"[👤] <b>{u['nickname']}</b>\n"
+        f"@{u['username'] or '—'}\n"
         f"Game ID: <code>{u['game_id']}</code>\n\n"
         f"💠 <b>Статистика:</b>\n"
         f"League: {league_txt}\n"
@@ -255,24 +243,27 @@ async def profile(c: CallbackQuery):
 #                         PARTY
 # ============================================================
 class PartyInvite(StatesGroup):
-    wait_user = State()
+    wait_login = State()
 
 
 async def render_party(c: CallbackQuery):
     p = await db.get_party_by_member(c.from_user.id)
     if not p:
-        txt = "🎉 <b>Party</b>\n\nТы не в пати.\nНажми «Создать лобби», чтобы собрать команду до 3 игроков."
-        await c.message.edit_text(txt, reply_markup=party_kb(has_party=False))
-        return
+        txt = ("🎉 <b>Party</b>\n\nТы не в пати.\n"
+               "Нажми «Создать лобби», чтобы собрать команду до 3 игроков.")
+        return await edit_or_send(c, txt, party_kb(has_party=False))
     members = json.loads(p["members"])
-    mentions = []
+    lines = []
     for uid in members:
         u = await db.get_user(uid)
         tag = "👑 " if uid == p["leader_id"] else "• "
-        mentions.append(f"{tag}{u['nickname'] if u else uid}")
+        if u:
+            lines.append(f"{tag}<b>{u['nickname']}</b> | @{u['username'] or '—'}")
+        else:
+            lines.append(f"{tag}{uid}")
     txt = (f"🎉 <b>Party</b>\n\n"
-           f"Участников: <b>{len(members)}/3</b>\n\n" + "\n".join(mentions))
-    await c.message.edit_text(txt, reply_markup=party_kb(has_party=True))
+           f"Участников: <b>{len(members)}/3</b>\n\n" + "\n".join(lines))
+    await edit_or_send(c, txt, party_kb(has_party=True))
 
 
 @router.callback_query(F.data == "menu_party")
@@ -282,8 +273,7 @@ async def party_menu(c: CallbackQuery):
 
 @router.callback_query(F.data == "party_create")
 async def party_create(c: CallbackQuery):
-    p = await db.get_party_by_member(c.from_user.id)
-    if p:
+    if await db.get_party_by_member(c.from_user.id):
         return await c.answer("Ты уже в пати!", show_alert=True)
     await db.create_party(c.from_user.id)
     await c.answer("✅ Лобби пати создано!")
@@ -297,29 +287,30 @@ async def party_invite(c: CallbackQuery, state: FSMContext):
         return await c.answer("Сначала создай пати.", show_alert=True)
     if p["leader_id"] != c.from_user.id:
         return await c.answer("Только лидер пати может приглашать.", show_alert=True)
-    members = json.loads(p["members"])
-    if len(members) >= 3:
+    if len(json.loads(p["members"])) >= 3:
         return await c.answer("Пати уже заполнено (макс. 3).", show_alert=True)
-    await state.set_state(PartyInvite.wait_user)
+    await state.set_state(PartyInvite.wait_login)
     await c.message.edit_text(
         "✉️ <b>Приглашение в пати</b>\n\n"
-        "Отправь <b>Telegram user_id</b> игрока, которого хочешь пригласить.\n"
-        "Его можно узнать, переслав сообщение игрока боту @userinfobot.",
-        reply_markup=back_menu()
-    )
+        "Отправь <b>@username</b> или <b>игровой ник</b> игрока.\n"
+        "Например: <code>@ivan_petrov</code> или <code>IVAN228</code>",
+        reply_markup=back_menu())
 
 
-@router.message(PartyInvite.wait_user)
+@router.message(PartyInvite.wait_login)
 async def party_invite_do(m: Message, state: FSMContext):
-    if not m.text or not m.text.isdigit():
-        return await m.answer("⚠️ Введи числовой user_id.")
-    target_id = int(m.text)
+    login = (m.text or "").strip()
+    if not login:
+        return await m.answer("⚠️ Введи @username или ник.")
+
+    target = await db.find_user_by_login(login)
+    if not target:
+        await state.clear()
+        return await m.answer("❌ Игрок не найден. Проверь @username или ник.",
+                              reply_markup=back_menu())
 
     p = await db.get_party_by_member(m.from_user.id)
-    if not p:
-        await state.clear()
-        return await m.answer("Пати не найдено.", reply_markup=back_menu())
-    if p["leader_id"] != m.from_user.id:
+    if not p or p["leader_id"] != m.from_user.id:
         await state.clear()
         return await m.answer("Только лидер может приглашать.", reply_markup=back_menu())
 
@@ -328,40 +319,30 @@ async def party_invite_do(m: Message, state: FSMContext):
         await state.clear()
         return await m.answer("Пати уже заполнено.", reply_markup=back_menu())
 
-    if target_id in members:
+    if target["user_id"] in members:
         await state.clear()
         return await m.answer("Игрок уже в пати.", reply_markup=back_menu())
 
-    target = await db.get_user(target_id)
-    if not target:
+    if await db.get_party_by_member(target["user_id"]):
         await state.clear()
-        return await m.answer("Игрок не найден в базе (пусть напишет /start боту).",
-                              reply_markup=back_menu())
+        return await m.answer("Этот игрок уже в другой пати.", reply_markup=back_menu())
 
-    other = await db.get_party_by_member(target_id)
-    if other:
-        await state.clear()
-        return await m.answer("Этот игрок уже состоит в другой пати.", reply_markup=back_menu())
-
-    members.append(target_id)
+    members.append(target["user_id"])
     await db.update_party(p["id"], members)
     await state.clear()
 
     await m.answer(
         f"✅ <b>{target['nickname']}</b> добавлен в пати.\n"
         f"Участников: <b>{len(members)}/3</b>",
-        reply_markup=back_menu()
-    )
+        reply_markup=back_menu())
 
-    # Уведомляем приглашённого
     try:
         leader = await db.get_user(m.from_user.id)
         await bot.send_message(
-            target_id,
+            target["user_id"],
             f"✉️ Тебя пригласили в пати к <b>{leader['nickname']}</b>!\n"
             f"Открой <b>🎉 Party</b> в главном меню.",
-            parse_mode=ParseMode.HTML
-        )
+            parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -375,12 +356,7 @@ async def party_leave(c: CallbackQuery):
     if not members:
         await db.delete_party(p["id"])
     else:
-        if p["leader_id"] == c.from_user.id:
-            await db.update_party(p["id"], members)
-            # передать лидерство первому в списке
-            await db.update_user(c.from_user.id, is_admin=0)  # без изменений, просто заглушка
-        else:
-            await db.update_party(p["id"], members)
+        await db.update_party(p["id"], members)
     await c.answer("🚪 Ты вышел из пати.")
     await render_party(c)
 
@@ -394,10 +370,8 @@ class Ticket(StatesGroup):
 
 @router.callback_query(F.data == "menu_ticket")
 async def ticket_menu(c: CallbackQuery):
-    await c.message.edit_text(
-        "🎫 <b>Тикет поддержки</b>\n\nВыбери тип обращения:",
-        reply_markup=ticket_kb()
-    )
+    await c.message.edit_text("🎫 <b>Тикет поддержки</b>\n\nВыбери тип:",
+                              reply_markup=ticket_kb())
 
 
 @router.callback_query(F.data.startswith("ticket:"))
@@ -441,22 +415,17 @@ async def search_league(c: CallbackQuery):
     u = await db.get_user(c.from_user.id)
     if not u:
         return await c.answer("Сначала зарегистрируйся.", show_alert=True)
-
-    user_league = u.get("league") or "default"
-    if league == "pro" and user_league != "pro":
+    if league == "pro" and (u.get("league") or "default") != "pro":
         return await c.answer("🚫 Тебе недоступна Pro league.", show_alert=True)
-
     lobby = await db.get_open_lobby(mode, league)
     if not lobby:
         return await c.answer("❌ Открытых лобби нет. Подожди обновления.", show_alert=True)
-
     await c.message.edit_text(
         f"✅ Игра найдена!\n\n"
         f"Режим: <b>{mode}</b>\nЛига: <b>{LEAGUES[league]}</b>\n"
         f"Карта: <b>{lobby['map']}</b>\n\n"
         f"➡️ Переходи в чат лобби и нажми «Присоединиться».",
-        reply_markup=back_menu()
-    )
+        reply_markup=back_menu())
 
 
 # ============================================================
@@ -507,8 +476,7 @@ async def refresh_lobby_message(lobby_id):
         await bot.edit_message_text(
             chat_id=l["chat_id"], message_id=l["message_id"],
             text=render_lobby(l, players),
-            reply_markup=lobby_kb(l["id"])
-        )
+            reply_markup=lobby_kb(l["id"]))
     except Exception as e:
         print("edit lobby err:", e)
 
@@ -519,11 +487,9 @@ async def lobby_join(c: CallbackQuery):
     l = await db.get_lobby(lid)
     if not l or l["status"] != "open":
         return await c.answer("Лобби закрыто.", show_alert=True)
-
     u = await db.get_user(c.from_user.id)
     if not u:
         return await c.answer("Сначала /start в ЛС бота.", show_alert=True)
-
     if l["league"] == "pro" and (u.get("league") or "default") != "pro":
         return await c.answer("🚫 Только для Pro league игроков.", show_alert=True)
 
@@ -567,12 +533,9 @@ async def finalize_lobby(lid):
     host_id = ct[0]
     host = await db.get_user(host_id)
 
-    await db.update_lobby(
-        lid,
-        ct_team=json.dumps(ct), t_team=json.dumps(t),
-        host_id=host_id, status="full"
-    )
-    mid = await db.create_match(lid, host_id, ct, t, l["map"], l["league"], l["mode"])
+    await db.update_lobby(lid, ct_team=json.dumps(ct), t_team=json.dumps(t),
+                          host_id=host_id, status="full")
+    await db.create_match(lid, host_id, ct, t, l["map"], l["league"], l["mode"])
 
     ct_p = await render_players(ct)
     t_p = await render_players(t)
@@ -581,7 +544,7 @@ async def finalize_lobby(lid):
         "━━━━━━━━━━━━━━━━━━━",
         f"> {LEAGUES[l['league']]}",
         f"> Maps: <b>{l['map']}</b>",
-        f"> Host: <b>{host['nickname']}</b>",
+        f"> Host: <b>{host['nickname']}</b> (@{host['username'] or '—'})",
         f"> Номер матча: <b>{l['match_number']}</b>",
         "━━━━━━━━━━━━━━━━━━━",
         "📃 <b>Список игроков</b>",
@@ -608,8 +571,7 @@ async def finalize_lobby(lid):
             host_id,
             f"🖥 Ты стал <b>хостом</b> матча #{l['match_number']}!\n"
             f"Зайди в <b>My host</b> и зарегистрируй игру.",
-            parse_mode=ParseMode.HTML
-        )
+            parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -622,22 +584,53 @@ async def spawn_lobby(mode, league, chat_id):
     lid = await db.create_lobby(mode, league, map_name, num, chat_id)
     l = await db.get_lobby(lid)
     msg = await bot.send_message(
-        chat_id, render_lobby(l, []), reply_markup=lobby_kb(lid)
-    )
+        chat_id, render_lobby(l, []), reply_markup=lobby_kb(lid))
     await db.update_lobby(lid, message_id=msg.message_id)
 
 
-async def refresh_all_lobbies():
-    for (mode, league), chat_id in GROUPS.items():
+async def close_and_respawn(mode, league, chat_id):
+    """Удаляет открытые лобби в чате и создаёт новое."""
+    async with aiosqlite.connect(db.DB) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM lobbies WHERE chat_id=? AND status='open'",
+            (chat_id,))
+        old = [dict(r) for r in await cur.fetchall()]
+    for l in old:
         try:
-            await bot.send_message(
-                chat_id,
-                f"🔄 Обновление лобби <b>{mode}</b> | {LEAGUES[league]}",
-                parse_mode=ParseMode.HTML
-            )
+            await bot.delete_message(l["chat_id"], l["message_id"])
         except Exception:
             pass
-        await spawn_lobby(mode, league, chat_id)
+        await db.update_lobby(l["id"], status="closed")
+    await spawn_lobby(mode, league, chat_id)
+
+
+async def refresh_all_lobbies():
+    """Ручное обновление всех лобби (кнопка в админке)."""
+    for (mode, league), chat_id in GROUPS.items():
+        try:
+            await close_and_respawn(mode, league, chat_id)
+        except Exception as e:
+            print(f"refresh {mode}/{league} err:", e)
+
+
+async def auto_refresh_loop():
+    """Фоновая задача: обновляет все лобби каждые 15 минут."""
+    # Первая публикация сразу при старте
+    await asyncio.sleep(3)  # небольшая задержка, чтобы бот успел подняться
+    try:
+        await refresh_all_lobbies()
+        print("✅ Первичная публикация лобби выполнена")
+    except Exception as e:
+        print("Первичная публикация err:", e)
+
+    while True:
+        await asyncio.sleep(REFRESH_INTERVAL)
+        try:
+            await refresh_all_lobbies()
+            print(f"🔄 Автообновление лобби ({time.strftime('%H:%M:%S')})")
+        except Exception as e:
+            print("auto refresh err:", e)
 
 
 # ============================================================
@@ -693,9 +686,8 @@ async def host_register(c: CallbackQuery):
 @router.callback_query(F.data == "host_cancel")
 async def host_cancel(c: CallbackQuery):
     await c.message.edit_text(
-        "🚫 Заявка на отмену матча отправлена администрации.\n"
-        "Ожидай одобрения.", reply_markup=back_menu()
-    )
+        "🚫 Заявка на отмену матча отправлена администрации.\nОжидай одобрения.",
+        reply_markup=back_menu())
 
 
 # ============================================================
@@ -731,7 +723,6 @@ async def publish_results(mid):
         await bot.send_message(CHANNEL_RESULTS, "\n".join(lines))
     except Exception as e:
         print("results err:", e)
-
     for uid in ct:
         await db.apply_match_result(uid, True, 0, 0)
     for uid in t:
@@ -760,8 +751,8 @@ async def admin_list(c: CallbackQuery):
     for x in users[:50]:
         lg = "💎" if (x.get("league") or "default") == "pro" else "🟦"
         lines.append(
-            f"<code>{x['user_id']}</code> | {x['nickname']} | "
-            f"{x['game_id']} | {lg} | {'💠' if x['calibrated'] else '🔒'} {x['mmr']} MMR"
+            f"<b>{x['nickname']}</b> | @{x['username'] or '—'} | {x['game_id']} | "
+            f"{lg} | {'💠' if x['calibrated'] else '🔒'} {x['mmr']} MMR"
         )
     await c.message.edit_text("\n".join(lines), reply_markup=back_menu())
 
@@ -778,17 +769,15 @@ async def admin_users(c: CallbackQuery, state: FSMContext):
         return await c.answer("Нет доступа.", show_alert=True)
     await state.set_state(AdminAct.target)
     await c.message.edit_text(
-        "Отправь <b>user_id</b> игрока, с которым нужно взаимодействовать:"
-    )
+        "Введи <b>@username</b> или <b>игровой ник</b> игрока:\n"
+        "Например: <code>@ivan_petrov</code> или <code>IVAN228</code>")
 
 
 @router.message(AdminAct.target)
 async def admin_pick(m: Message, state: FSMContext):
-    if not m.text.isdigit():
-        return await m.answer("Введи числовой user_id.")
-    target = await db.get_user(int(m.text))
+    target = await db.find_user_by_login(m.text or "")
     if not target:
-        return await m.answer("Игрок не найден.")
+        return await m.answer("❌ Игрок не найден. Попробуй снова.")
     await state.update_data(target=target["user_id"])
     await state.set_state(AdminAct.action)
 
@@ -804,11 +793,9 @@ async def admin_pick(m: Message, state: FSMContext):
          B(text="💎 League: Pro",     callback_data="act:league_pro")],
     ]
     await m.answer(
-        f"Игрок: <b>{target['nickname']}</b>\n"
-        f"Текущая лига: <b>{cur_league}</b>\n\n"
-        f"Выбери действие:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns)
-    )
+        f"Игрок: <b>{target['nickname']}</b> (@{target['username'] or '—'})\n"
+        f"Текущая лига: <b>{cur_league}</b>\n\nВыбери действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 
 @router.callback_query(F.data.startswith("act:"))
@@ -816,29 +803,22 @@ async def admin_do(c: CallbackQuery, state: FSMContext):
     u = await db.get_user(c.from_user.id)
     if not is_admin(u):
         return await c.answer("Нет доступа.", show_alert=True)
-
     d = await state.get_data()
     uid = d.get("target")
     act = c.data.split(":")[1]
 
     if act == "league_default":
         await db.update_user(uid, league="default")
-        await c.message.edit_text("✅ Игроку выдана <b>Default league</b>.",
-                                  reply_markup=back_menu())
-        await state.clear()
-        return
+        await c.message.edit_text("✅ Выдана <b>Default league</b>.", reply_markup=back_menu())
+        await state.clear(); return
     if act == "league_pro":
         await db.update_user(uid, league="pro")
-        await c.message.edit_text("✅ Игроку выдана <b>Pro league</b>.",
-                                  reply_markup=back_menu())
-        await state.clear()
-        return
+        await c.message.edit_text("✅ Выдана <b>Pro league</b>.", reply_markup=back_menu())
+        await state.clear(); return
 
-    field = {
-        "ban":   ("is_banned", 1), "unban": ("is_banned", 0),
-        "mute":  ("is_muted", 1),  "unmute":("is_muted", 0),
-        "nohost":("can_host", 0),  "yeshost":("can_host", 1),
-    }[act]
+    field = {"ban": ("is_banned", 1), "unban": ("is_banned", 0),
+             "mute": ("is_muted", 1), "unmute": ("is_muted", 0),
+             "nohost": ("can_host", 0), "yeshost": ("can_host", 1)}[act]
     await db.update_user(uid, **{field[0]: field[1]})
     await c.message.edit_text(f"✅ Действие <b>{act}</b> выполнено.",
                               reply_markup=back_menu())
@@ -882,10 +862,9 @@ async def admin_edit(c: CallbackQuery):
     if not is_admin(u):
         return await c.answer("Нет доступа.", show_alert=True)
     await c.message.edit_text(
-        "✏️ Введи ID матча для публикации/редактирования результатов:\n"
+        "✏️ Введи ID матча для публикации результатов:\n"
         "Пример: <code>/result 5</code>",
-        reply_markup=back_menu()
-    )
+        reply_markup=back_menu())
 
 
 @router.message(Command("result"))
@@ -915,7 +894,7 @@ async def admin_map(c: CallbackQuery):
     if not is_admin(u):
         return await c.answer("Нет доступа.", show_alert=True)
     btns = []
-    for (mode, league), chat_id in GROUPS.items():
+    for (mode, league), _ in GROUPS.items():
         btns.append([B(text=f"{mode} | {LEAGUES[league]}",
                        callback_data=f"admin_setmap:{mode}:{league}")])
     btns.append([B(text="⬅️ Назад", callback_data="admin_panel")])
@@ -948,16 +927,15 @@ async def admin_grant(c: CallbackQuery, state: FSMContext):
     if not is_admin(u):
         return await c.answer("Нет доступа.", show_alert=True)
     await state.set_state(AdminGrant.target)
-    await c.message.edit_text("Отправь user_id игрока, которому выдать админку:")
+    await c.message.edit_text("Введи <b>@username</b> или <b>ник</b> игрока, "
+                              "которому выдать админку:")
 
 
 @router.message(AdminGrant.target)
 async def admin_grant_do(m: Message, state: FSMContext):
-    if not m.text.isdigit():
-        return await m.answer("Введи числовой user_id.")
-    target = await db.get_user(int(m.text))
+    target = await db.find_user_by_login(m.text or "")
     if not target:
-        return await m.answer("Игрок не найден.")
+        return await m.answer("❌ Игрок не найден.")
     await db.update_user(target["user_id"], is_admin=1)
     await state.clear()
     await m.answer(f"✅ <b>{target['nickname']}</b> получил админку.",
@@ -974,17 +952,16 @@ async def admin_revoke(c: CallbackQuery, state: FSMContext):
     if not is_admin(u):
         return await c.answer("Нет доступа.", show_alert=True)
     await state.set_state(AdminGrant.target)
-    await c.message.edit_text("Отправь user_id игрока, у которого забрать админку:")
+    await c.message.edit_text("Введи <b>@username</b> или <b>ник</b> игрока, "
+                              "у которого забрать админку:")
 
 
 @router.message(AdminGrant.target)
 async def admin_revoke_do(m: Message, state: FSMContext):
-    if not m.text.isdigit():
-        return await m.answer("Введи числовой user_id.")
-    target = await db.get_user(int(m.text))
+    target = await db.find_user_by_login(m.text or "")
     if not target:
-        return await m.answer("Игрок не найден.")
-    if (target.get("username") or "").lstrip("@") == OWNER_USERNAME:
+        return await m.answer("❌ Игрок не найден.")
+    if (target.get("username") or "").lstrip("@").lower() == OWNER_USERNAME.lower():
         return await m.answer("Нельзя забрать админку у владельца.")
     await db.update_user(target["user_id"], is_admin=0)
     await state.clear()
@@ -999,15 +976,14 @@ async def admin_tickets(c: CallbackQuery):
         return await c.answer("Нет доступа.", show_alert=True)
     ts = await db.open_tickets()
     if not ts:
-        return await c.message.edit_text("Нет открытых тикетов.",
-                                         reply_markup=back_menu())
+        return await c.message.edit_text("Нет открытых тикетов.", reply_markup=back_menu())
     lines = ["🎫 <b>Открытые тикеты:</b>", ""]
     btns = []
     for t in ts:
-        lines.append(f"#{t['id']} | {t['type']} | <code>{t['user_id']}</code>\n"
-                     f"<i>{t['description'][:80]}</i>")
-        btns.append([B(text=f"Закрыть #{t['id']}",
-                       callback_data=f"tclose:{t['id']}")])
+        author = await db.get_user(t["user_id"])
+        who = f"{author['nickname']} (@{author['username'] or '—'})" if author else t["user_id"]
+        lines.append(f"#{t['id']} | {t['type']} | {who}\n<i>{t['description'][:80]}</i>")
+        btns.append([B(text=f"Закрыть #{t['id']}", callback_data=f"tclose:{t['id']}")])
     btns.append([B(text="⬅️ Назад", callback_data="admin_panel")])
     await c.message.edit_text("\n\n".join(lines),
                               reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
@@ -1018,8 +994,7 @@ async def ticket_close(c: CallbackQuery):
     u = await db.get_user(c.from_user.id)
     if not is_admin(u):
         return await c.answer("Нет доступа.", show_alert=True)
-    tid = int(c.data.split(":")[1])
-    await db.close_ticket(tid)
+    await db.close_ticket(int(c.data.split(":")[1]))
     await c.answer("✅ Тикет закрыт.")
     await admin_tickets(c)
 
@@ -1051,7 +1026,7 @@ async def cmd_next(m: Message):
         return
     for (mode, league), chat_id in GROUPS.items():
         if chat_id == m.chat.id:
-            await spawn_lobby(mode, league, chat_id)
+            await close_and_respawn(mode, league, chat_id)
             return
     await m.answer("Этот чат не является лобби-группой.")
 
@@ -1065,6 +1040,10 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Запускаем фоновую задачу авто-обновления лобби
+    asyncio.create_task(auto_refresh_loop())
+
     print("🤖 404hp faceit bot started")
     await dp.start_polling(bot)
 
