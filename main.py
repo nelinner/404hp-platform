@@ -457,17 +457,13 @@ def render_lobby(lobby, players):
         "📃 <b>Список игроков</b>",
         f"— Собрано игроков {len(players)}/{MODE_SIZES[lobby['mode']]}",
         "━━━━━━━━━━━━━━━━━━━",
-        "",
-        "🔵 <b>CT:</b>",
     ]
-    ct = players[::2]
-    t = players[1::2]
-    for p in ct:
-        lines.append(f"[👤] {p['nickname']} | {p['game_id']} | LV {p['lvl']}")
-    lines += ["", "🔴 <b>T:</b>"]
-    for p in t:
-        lines.append(f"[👤] {p['nickname']} | {p['game_id']} | LV {p['lvl']}")
-    lines += ["", "━━━━━━━━━━━━━━━━━━━"]
+    if players:
+        for p in players:
+            lines.append(f"[👤] {p['nickname']} | {p['game_id']} | LVL {p['lvl']}")
+    else:
+        lines.append("<i>Пока никто не присоединился</i>")
+    lines.append("━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
 
 
