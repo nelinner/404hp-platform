@@ -2,6 +2,10 @@ import aiosqlite, json, time
 
 DB = "404hp.db"
 
+
+# ============================================================
+#                       INIT
+# ============================================================
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.executescript("""
@@ -42,6 +46,7 @@ async def init_db():
             status TEXT DEFAULT 'open',
             message_id INTEGER,
             chat_id INTEGER,
+            thread_id INTEGER,
             registered INTEGER DEFAULT 0,
             created_at INTEGER
         );
@@ -65,7 +70,10 @@ async def init_db():
         """)
         await db.commit()
 
-# ---------- USERS ----------
+
+# ============================================================
+#                       USERS
+# ============================================================
 async def get_user(uid):
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
@@ -73,22 +81,49 @@ async def get_user(uid):
         r = await cur.fetchone()
         return dict(r) if r else None
 
+
+async def find_user_by_login(login: str):
+    """Ищет игрока по @username (Telegram) ИЛИ по игровому нику. Без учёта регистра."""
+    if not login:
+        return None
+    q = str(login).strip().lstrip("@").lower()
+
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+
+        # 1) по telegram username
+        cur = await db.execute(
+            "SELECT * FROM users WHERE LOWER(username)=?", (q,))
+        r = await cur.fetchone()
+        if r:
+            return dict(r)
+
+        # 2) по игровому нику
+        cur = await db.execute(
+            "SELECT * FROM users WHERE LOWER(nickname)=?", (q,))
+        r = await cur.fetchone()
+        return dict(r) if r else None
+
+
 async def create_user(uid, username, game_id, nickname):
     async with aiosqlite.connect(DB) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO users (user_id,username,game_id,nickname,registered,league,created_at) "
+            "INSERT OR REPLACE INTO users "
+            "(user_id,username,game_id,nickname,registered,league,created_at) "
             "VALUES (?,?,?,?,1,'default',?)",
-            (uid, username, game_id, nickname, int(time.time()))
-        )
+            (uid, username, game_id, nickname, int(time.time())))
         await db.commit()
 
+
 async def update_user(uid, **fields):
-    if not fields: return
+    if not fields:
+        return
     keys = ", ".join(f"{k}=?" for k in fields)
     vals = list(fields.values()) + [uid]
     async with aiosqlite.connect(DB) as db:
         await db.execute(f"UPDATE users SET {keys} WHERE user_id=?", vals)
         await db.commit()
+
 
 async def all_users():
     async with aiosqlite.connect(DB) as db:
@@ -96,9 +131,11 @@ async def all_users():
         cur = await db.execute("SELECT * FROM users ORDER BY mmr DESC")
         return [dict(r) for r in await cur.fetchall()]
 
+
 async def apply_match_result(uid, win: bool, kills: int, deaths: int):
     u = await get_user(uid)
-    if not u: return
+    if not u:
+        return
     games = u["games_played"] + 1
     mmr = u["mmr"]
     if not u["calibrated"]:
@@ -117,7 +154,10 @@ async def apply_match_result(uid, win: bool, kills: int, deaths: int):
         calibrated=1 if games >= 10 else u["calibrated"],
     )
 
-# ---------- PARTY ----------
+
+# ============================================================
+#                       PARTY
+# ============================================================
 async def get_party_by_member(uid):
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
@@ -127,14 +167,15 @@ async def get_party_by_member(uid):
                 return dict(r)
     return None
 
+
 async def create_party(leader_id):
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             "INSERT INTO parties (leader_id,members,created_at) VALUES (?,?,?)",
-            (leader_id, json.dumps([leader_id]), int(time.time()))
-        )
+            (leader_id, json.dumps([leader_id]), int(time.time())))
         await db.commit()
         return cur.lastrowid
+
 
 async def update_party(pid, members):
     async with aiosqlite.connect(DB) as db:
@@ -142,21 +183,28 @@ async def update_party(pid, members):
                          (json.dumps(members), pid))
         await db.commit()
 
+
 async def delete_party(pid):
     async with aiosqlite.connect(DB) as db:
         await db.execute("DELETE FROM parties WHERE id=?", (pid,))
         await db.commit()
 
-# ---------- LOBBIES ----------
-async def create_lobby(mode, league, map_name, match_number, chat_id):
+
+# ============================================================
+#                       LOBBIES
+# ============================================================
+async def create_lobby(mode, league, map_name, match_number,
+                       chat_id, thread_id=None):
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            "INSERT INTO lobbies (mode,league,map,match_number,players,ct_team,t_team,chat_id,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (mode, league, map_name, match_number, "[]", "[]", "[]", chat_id, int(time.time()))
-        )
+            "INSERT INTO lobbies (mode,league,map,match_number,players,"
+            "ct_team,t_team,chat_id,thread_id,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (mode, league, map_name, match_number, "[]", "[]", "[]",
+             chat_id, thread_id, int(time.time())))
         await db.commit()
         return cur.lastrowid
+
 
 async def get_lobby(lid):
     async with aiosqlite.connect(DB) as db:
@@ -165,33 +213,26 @@ async def get_lobby(lid):
         r = await cur.fetchone()
         return dict(r) if r else None
 
-async def get_lobby_by_msg(chat_id, message_id):
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT * FROM lobbies WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id)
-        )
-        r = await cur.fetchone()
-        return dict(r) if r else None
 
 async def get_open_lobby(mode, league):
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT * FROM lobbies WHERE mode=? AND league=? AND status='open' "
-            "ORDER BY id DESC LIMIT 1", (mode, league)
-        )
+            "ORDER BY id DESC LIMIT 1", (mode, league))
         r = await cur.fetchone()
         return dict(r) if r else None
 
+
 async def update_lobby(lid, **f):
-    if not f: return
+    if not f:
+        return
     keys = ", ".join(f"{k}=?" for k in f)
     vals = list(f.values()) + [lid]
     async with aiosqlite.connect(DB) as db:
         await db.execute(f"UPDATE lobbies SET {keys} WHERE id=?", vals)
         await db.commit()
+
 
 async def next_match_number():
     async with aiosqlite.connect(DB) as db:
@@ -199,43 +240,56 @@ async def next_match_number():
         (c,) = await cur.fetchone()
         return c + 1
 
-# ---------- TICKETS ----------
+
+# ============================================================
+#                       TICKETS
+# ============================================================
 async def create_ticket(uid, ttype, desc):
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
-            "INSERT INTO tickets (user_id,type,description,created_at) VALUES (?,?,?,?)",
-            (uid, ttype, desc, int(time.time()))
-        )
+            "INSERT INTO tickets (user_id,type,description,created_at) "
+            "VALUES (?,?,?,?)",
+            (uid, ttype, desc, int(time.time())))
         await db.commit()
         return cur.lastrowid
+
 
 async def open_tickets():
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM tickets WHERE status='open' ORDER BY id")
+        cur = await db.execute(
+            "SELECT * FROM tickets WHERE status='open' ORDER BY id")
         return [dict(r) for r in await cur.fetchall()]
+
 
 async def close_ticket(tid):
     async with aiosqlite.connect(DB) as db:
         await db.execute("UPDATE tickets SET status='closed' WHERE id=?", (tid,))
         await db.commit()
 
-# ---------- MATCHES ----------
+
+# ============================================================
+#                       MATCHES
+# ============================================================
 async def create_match(lobby_id, host_id, ct, t, map_name, league, mode):
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute(
             "INSERT INTO matches (lobby_id,host_id,ct_team,t_team,map,league,mode,created_at) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            (lobby_id, host_id, json.dumps(ct), json.dumps(t), map_name, league, mode, int(time.time()))
-        )
+            (lobby_id, host_id, json.dumps(ct), json.dumps(t),
+             map_name, league, mode, int(time.time())))
         await db.commit()
         return cur.lastrowid
+
 
 async def matches_by_host(host_id):
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM matches WHERE host_id=? AND status='pending'", (host_id,))
+        cur = await db.execute(
+            "SELECT * FROM matches WHERE host_id=? AND status='pending'",
+            (host_id,))
         return [dict(r) for r in await cur.fetchall()]
+
 
 async def get_match(mid):
     async with aiosqlite.connect(DB) as db:
@@ -244,34 +298,15 @@ async def get_match(mid):
         r = await cur.fetchone()
         return dict(r) if r else None
 
+
 async def set_match_status(mid, status):
     async with aiosqlite.connect(DB) as db:
         await db.execute("UPDATE matches SET status=? WHERE id=?", (status, mid))
         await db.commit()
+
 
 async def all_pending_matches():
     async with aiosqlite.connect(DB) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM matches WHERE status='pending'")
         return [dict(r) for r in await cur.fetchall()]
-
-async def find_user_by_login(login: str):
-    """Ищет игрока по @username (телеграм) ИЛИ по игровому нику. Без учёта регистра."""
-    if not login:
-        return None
-    q = login.strip().lstrip("@").lower()
-    async with aiosqlite.connect(DB) as db:
-        db.row_factory = aiosqlite.Row
-        # 1) по telegram username
-        cur = await db.execute(
-            "SELECT * FROM users WHERE LOWER(username)=?", (q,)
-        )
-        r = await cur.fetchone()
-        if r:
-            return dict(r)
-        # 2) по игровому нику
-        cur = await db.execute(
-            "SELECT * FROM users WHERE LOWER(nickname)=?", (q,)
-        )
-        r = await cur.fetchone()
-        return dict(r) if r else None
