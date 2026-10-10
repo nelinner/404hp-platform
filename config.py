@@ -1,4 +1,4 @@
-BOT_TOKEN = "ВАШ_ТОКЕН_ОТ_BOTFATHER"
+BOT_TOKEN = "8668847269:AAG1aKg-YX3tE5cFic10mryMmozLqN1aBm0"
 
 # Супергруппы для лобби (замени на реальные -100... ID)
 GROUPS = {
