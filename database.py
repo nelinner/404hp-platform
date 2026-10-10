@@ -254,3 +254,24 @@ async def all_pending_matches():
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM matches WHERE status='pending'")
         return [dict(r) for r in await cur.fetchall()]
+
+async def find_user_by_login(login: str):
+    """Ищет игрока по @username (телеграм) ИЛИ по игровому нику. Без учёта регистра."""
+    if not login:
+        return None
+    q = login.strip().lstrip("@").lower()
+    async with aiosqlite.connect(DB) as db:
+        db.row_factory = aiosqlite.Row
+        # 1) по telegram username
+        cur = await db.execute(
+            "SELECT * FROM users WHERE LOWER(username)=?", (q,)
+        )
+        r = await cur.fetchone()
+        if r:
+            return dict(r)
+        # 2) по игровому нику
+        cur = await db.execute(
+            "SELECT * FROM users WHERE LOWER(nickname)=?", (q,)
+        )
+        r = await cur.fetchone()
+        return dict(r) if r else None
